@@ -1,6 +1,6 @@
 use good_lp::{
-    constraint, default_solver, variable, variables, Constraint, Expression, Solution, SolverModel,
-    Variable,
+    constraint, default_solver, variable, variables, Constraint, Expression, ProblemVariables,
+    Solution, SolverModel, Variable,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -15,6 +15,86 @@ struct PenaltyVar {
     // entity_name: String,
     // instance: usize,
     var: Variable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Before,
+    After,
+}
+
+/// For each subject clock s, we create binary vars x_{s,o} for every object clock o,
+/// and require sum(x_{s,o}) >= 1.
+/// If x_{s,o} = 1, then we enforce "s is at least 'offset' [Before|After] o".
+fn apply_min_offset_at_least_one(
+    builder: &mut ProblemVariables,
+    add_constraint: &mut dyn FnMut(&str, Constraint),
+    direction: Direction,
+    subjects: &[ClockVar],
+    objects: &[ClockVar],
+    offset_minutes: f64,
+    big_m: f64,
+    label_prefix: &str,
+) {
+    // If no object clocks, do nothing or optionally log a warning:
+    if objects.is_empty() {
+        return;
+    }
+
+    for s_cv in subjects {
+        // We'll gather up the x_{s,o} for each object
+        let mut x_vars = Vec::with_capacity(objects.len());
+
+        for o_cv in objects {
+            // Create a binary var x_{s,o}
+            let x_so = builder.add(variable().binary());
+            x_vars.push(x_so);
+
+            // The big-M constraint depends on direction
+            // - AFTER => s_cv.var >= o_cv.var + offset
+            // - BEFORE => s_cv.var + offset <= o_cv.var (equivalently o_cv.var - s_cv.var >= offset)
+            match direction {
+                Direction::After => {
+                    let desc = format!(
+                        "({label_prefix}) after: {} >= {} + {} if x_so=1",
+                        c2str(s_cv),
+                        c2str(o_cv),
+                        offset_minutes
+                    );
+                    // s - o >= offset - M*(1 - x)
+                    add_constraint(
+                        &desc,
+                        constraint!(s_cv.var - o_cv.var >= offset_minutes - big_m * (1.0 - x_so)),
+                    );
+                }
+                Direction::Before => {
+                    let desc = format!(
+                        "({label_prefix}) before: {} + {} <= {} if x_so=1",
+                        c2str(s_cv),
+                        offset_minutes,
+                        c2str(o_cv)
+                    );
+                    // o - s >= offset - M*(1 - x)
+                    add_constraint(
+                        &desc,
+                        constraint!(o_cv.var - s_cv.var >= offset_minutes - big_m * (1.0 - x_so)),
+                    );
+                }
+            }
+        }
+
+        // Force sum(x_{s,o}) >= 1 => the subject picks at least one object
+        let mut sum_expr = Expression::from(0.0);
+        for x_so in x_vars {
+            sum_expr += x_so;
+        }
+        let desc = format!(
+            "({label_prefix}) sum_x_{} >= 1 => subject {} must link to at least one object",
+            s_cv.instance,
+            c2str(s_cv)
+        );
+        add_constraint(&desc, constraint!(sum_expr >= 1.0));
+    }
 }
 
 /// Main scheduling function that takes entities and config, returns optimized schedule
@@ -111,7 +191,7 @@ pub fn solve_schedule(
             None => continue,
         };
 
-        let mut ba_map: HashMap<String, (Option<f64>, Option<f64>)> = HashMap::new();
+        let ba_map: HashMap<String, (Option<f64>, Option<f64>)> = HashMap::new();
         let mut apart_intervals = Vec::new();
         let mut apart_from_list = Vec::new();
 
@@ -128,14 +208,32 @@ pub fn solve_schedule(
                 }
                 ConstraintType::Before => {
                     if let ConstraintRef::Unresolved(r) = &cexpr.cref {
-                        let ent = ba_map.entry(r.clone()).or_insert((None, None));
-                        ent.0 = Some(tv_min);
+                        let objects = resolve_ref(r);
+                        apply_min_offset_at_least_one(
+                            &mut builder,
+                            &mut add_constraint,
+                            Direction::Before,
+                            &eclocks, // subject
+                            &objects, // object
+                            tv_min,
+                            big_m,
+                            "BeforeSome",
+                        );
                     }
                 }
                 ConstraintType::After => {
                     if let ConstraintRef::Unresolved(r) = &cexpr.cref {
-                        let ent = ba_map.entry(r.clone()).or_insert((None, None));
-                        ent.1 = Some(tv_min);
+                        let objects = resolve_ref(r);
+                        apply_min_offset_at_least_one(
+                            &mut builder,
+                            &mut add_constraint,
+                            Direction::After,
+                            &eclocks, // subject
+                            &objects, // object
+                            tv_min,
+                            big_m,
+                            "AfterSome",
+                        );
                     }
                 }
             }
